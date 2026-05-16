@@ -20,11 +20,15 @@ client = OpenAI(api_key=OPENAI_API_KEY)
 
 seen_links = set()
 
+# 最低推送分数
 MIN_SCORE = 7
+
+# 每天最多 AI 分析 100 条，避免 API 花费过快
 MAX_AI_ANALYSIS_PER_DAY = 100
 daily_ai_count = 0
 daily_count_date = date.today()
 
+# 热门板块关键词
 KEYWORDS = [
     # AI / 半导体 / 光模块 / CPO / 数据中心
     "AI", "artificial intelligence", "machine learning",
@@ -40,6 +44,54 @@ KEYWORDS = [
     "AI infrastructure", "networking", "switching",
     "compute", "cloud", "server",
 
+    # 机器人 / 自动化 / 自动驾驶 / 无人机
+    "robotics", "robot", "automation", "autonomous",
+    "autonomous driving", "self-driving",
+    "ADAS", "lidar", "LiDAR",
+    "drone", "drones", "UAV",
+    "industrial automation",
+
+    # 国防军工 / 航天 / 卫星
+    "defense", "military", "aerospace",
+    "space", "satellite", "satellites",
+    "launch", "rocket", "spacecraft",
+    "missile", "radar", "surveillance",
+    "government contract", "department of defense", "DoD",
+
+    # 核能 / 电力 / 铀矿 / 能源
+    "nuclear", "SMR", "small modular reactor",
+    "uranium", "reactor",
+    "power grid", "grid", "electricity",
+    "energy storage", "battery storage",
+    "clean energy", "renewable energy",
+
+    # 加密货币 / 区块链 / 金融科技
+    "bitcoin", "BTC", "crypto", "cryptocurrency",
+    "blockchain", "stablecoin", "digital asset",
+    "mining", "bitcoin mining",
+    "fintech", "payments", "payment platform",
+
+    # 量子计算 / 网络安全 / 云计算 / 软件
+    "quantum", "quantum computing",
+    "cybersecurity", "cyber security",
+    "cloud", "SaaS", "software",
+    "zero trust", "identity security",
+
+    # 生物医药 / FDA / 临床
+    "FDA", "approval", "clearance",
+    "phase 3", "phase III", "phase 2", "phase II",
+    "clinical trial", "primary endpoint",
+    "biotech", "pharmaceutical",
+    "drug", "therapy", "treatment",
+    "GLP-1", "obesity", "diabetes",
+    "oncology", "cancer",
+
+    # 电池 / 储能 / 稀土 / 金属资源
+    "lithium", "battery", "batteries",
+    "solid-state battery",
+    "rare earth", "copper", "gold", "silver",
+    "mining", "critical minerals",
+
     # 财报超预期 / guidance
     "earnings", "results", "financial results",
     "quarterly results", "q1 results", "q2 results", "q3 results", "q4 results",
@@ -49,9 +101,20 @@ KEYWORDS = [
     "raises guidance", "raise guidance", "raised guidance",
     "guidance", "outlook", "forecast",
     "record revenue", "record revenues",
-    "profit", "margin", "gross margin"
+    "profit", "margin", "gross margin",
+
+    # 重大交易 / 并购 / 回购 / 大单
+    "contract", "major contract", "award",
+    "partnership", "strategic partnership",
+    "collaboration", "customer win",
+    "backlog", "order", "orders",
+    "acquisition", "merger", "buyout",
+    "takeover", "strategic alternatives",
+    "tender offer",
+    "share repurchase", "buyback"
 ]
 
+# 明显低价值新闻，提前跳过，不浪费 AI 额度
 LOW_VALUE_WORDS = [
     "conference", "webcast", "presentation",
     "appoints", "appointment", "management change",
@@ -93,12 +156,13 @@ def keyword_match(text):
 def low_value_match(text):
     t = text.lower()
 
-    # 如果是财报新闻，不因为 earnings call / announces date 误杀
+    # 财报结果类新闻不要被 earnings call 误杀
     earnings_terms = [
         "reports", "reported", "financial results",
         "quarterly results", "revenue", "eps",
         "raises guidance", "raised guidance",
-        "beats", "exceeds", "record revenue"
+        "beats", "exceeds", "record revenue",
+        "announces record", "strong outlook"
     ]
 
     if any(e.lower() in t for e in earnings_terms):
@@ -146,7 +210,7 @@ def fetch_latest_news():
         if item not in results:
             results.append(item)
 
-        if len(results) >= 25:
+        if len(results) >= 30:
             break
 
     return results
@@ -162,7 +226,7 @@ def fetch_article_text(link):
 
         soup = BeautifulSoup(r.text, "html.parser")
         text = " ".join(soup.get_text(" ", strip=True).split())
-        return text[:6000]
+        return text[:7000]
 
     except Exception as e:
         print("Article fetch error:", e)
@@ -189,7 +253,7 @@ def pre_filter_news(title, article_text):
         return False, "低价值新闻，跳过，不消耗 AI 额度"
 
     if not keyword_match(combined):
-        return False, "不属于 AI / 半导体 / 光模块 / CPO / 数据中心 / 财报超预期方向，跳过"
+        return False, "不属于热门板块 / 财报超预期 / 大单并购方向，跳过"
 
     if not is_nasdaq_article(title, article_text):
         return False, "不是 NASDAQ 股票新闻，跳过"
@@ -233,18 +297,15 @@ def analyze_news(title, link, article_text):
 你是美股事件驱动交易员，专门筛选短线可能大涨的 NASDAQ 股票新闻。
 
 目标：
-只推送两类高价值新闻：
+只推送 NASDAQ 上市公司中，市值 10 亿美元及以上，并且属于热门板块或财报超预期的高价值新闻。
 
-A类：AI、半导体、光模块、CPO、数据中心、硅光、光通信、GPU、800G、1.6T、VCSEL 等相关高价值新闻。
-
-B类：纳斯达克上市公司财报明显超预期的新闻，包括 revenue beat、EPS beat、raises guidance、record revenue、margin improvement、strong outlook、backlog growth 等。
+热门板块包括：
+AI、半导体、光模块、CPO、数据中心、机器人、自动驾驶、无人机、国防军工、航天卫星、核能、铀矿、电力、储能、加密货币、区块链、金融科技、量子计算、网络安全、云计算、生物医药、FDA、临床三期、GLP-1、锂电池、稀土、铜、黄金、重大并购、大订单、回购、财报超预期、guidance 上调。
 
 硬性推送条件：
 1. 必须是 NASDAQ 上市公司；
 2. 估算市值必须在 10 亿美元及以上，也就是 market_cap_usd 必须返回 ">=1B"；
-3. 新闻必须满足以下至少一种：
-   - 属于 AI / 半导体 / 光模块 / CPO / 数据中心 / 硅光 / 光通信 / GPU / 高速互联方向；
-   - 或者属于财报明显超预期 / guidance 上调 / revenue 或 EPS 大幅 beat；
+3. 新闻必须属于热门板块、财报超预期、guidance 上调、大订单、并购、回购、重大合同其中之一；
 4. 评分必须 >= 7；
 5. 短线暴涨潜力必须是 high 或 medium；
 6. 满足以上条件才 action = "push"，否则 action = "skip"。
@@ -268,6 +329,8 @@ B类：纳斯达克上市公司财报明显超预期的新闻，包括 revenue b
 - NVIDIA / Microsoft / Amazon / Google / Meta / hyperscaler 合作
 - 半导体产品进入量产
 - 光模块 / CPO / 硅光 / 800G / 1.6T 相关重大进展
+- 机器人 / 自动驾驶 / 无人机 / 国防 / 航天 / 核能 / 量子 / 加密货币 / 生物医药等热门板块重大进展
+- FDA approval / phase 3 成功 / primary endpoint met
 - 大金额融资
 - buyout / acquisition / tender offer / strategic alternatives
 - 10 亿美元以上但仍容易异动的中小市值 NASDAQ 公司
@@ -284,6 +347,7 @@ B类：纳斯达克上市公司财报明显超预期的新闻，包括 revenue b
 - 大盘成熟公司但催化不强
 - 业绩 beat 但 guidance 下调
 - 收入增长弱、亏损扩大、现金流恶化
+- 和热门板块无关
 
 新闻标题：
 {title}
@@ -292,13 +356,13 @@ B类：纳斯达克上市公司财报明显超预期的新闻，包括 revenue b
 {link}
 
 新闻正文节选：
-{article_text[:3500]}
+{article_text[:4000]}
 
 请严格返回 JSON，不要输出任何多余文字：
 {{
   "score": 0,
   "sentiment": "bullish/bearish/neutral",
-  "sector": "AI/semiconductor/optical/CPO/datacenter/earnings/other",
+  "sector": "AI/semiconductor/optical/CPO/datacenter/robotics/autonomous/defense/space/nuclear/crypto/quantum/cybersecurity/biotech/energy/metals/earnings/M&A/other",
   "is_nasdaq": true,
   "market_cap_usd": ">=1B/<1B/unknown",
   "move_potential": "high/medium/low/unknown",
@@ -376,111 +440,4 @@ def process_news_item(title, link):
 
     if (
         score >= MIN_SCORE
-        and action == "push"
-        and is_nasdaq is True
-        and market_cap_usd == ">=1B"
-        and move_potential in ["high", "medium"]
-    ):
-        message = (
-            f"🚨 NASDAQ 高价值新闻\n\n"
-            f"评分：{score}/10\n"
-            f"方向：{analysis.get('sector')}\n"
-            f"情绪：{analysis.get('sentiment')}\n"
-            f"市值判断：{market_cap_usd}\n"
-            f"暴涨潜力：{move_potential}\n"
-            f"财报超预期：{analysis.get('earnings_surprise')}\n"
-            f"原因：{analysis.get('reason')}\n\n"
-            f"标题：{title}\n\n"
-            f"{link}"
-        )
-        send_telegram(message)
-
-    return analysis
-
-def news_worker():
-    while True:
-        try:
-            news_items = fetch_latest_news()
-
-            for item in news_items:
-                title = item["title"]
-                link = item["link"]
-
-                if link in seen_links:
-                    continue
-
-                seen_links.add(link)
-
-                process_news_item(title, link)
-
-        except Exception as e:
-            print("News worker error:", e)
-
-        time.sleep(10)
-
-@app.route("/")
-def home():
-    return "stock-news-bot NASDAQ >=1B AI semiconductor optical CPO earnings surprise filter is running"
-
-@app.route("/test")
-def test():
-    send_telegram("✅ stock-news-bot NASDAQ >=1B AI + earnings filter test message")
-    return "test sent"
-
-@app.route("/latest")
-def latest():
-    try:
-        reset_daily_counter_if_needed()
-
-        news_items = fetch_latest_news()
-
-        if not news_items:
-            return "No news found from StockTitan webpage."
-
-        items = []
-
-        for item in news_items[:8]:
-            title = item["title"]
-            link = item["link"]
-            article_text = fetch_article_text(link)
-
-            passed, filter_reason = pre_filter_news(title, article_text)
-
-            if not passed:
-                items.append(
-                    f"<b>{title}</b><br>"
-                    f"Pre-filter: SKIP<br>"
-                    f"Reason: {filter_reason}<br>"
-                    f"<a href=' '>{link}</a ><br><br>"
-                )
-                continue
-
-            analysis = analyze_news(title, link, article_text)
-
-            items.append(
-                f"<b>{title}</b><br>"
-                f"Score: {analysis.get('score')}/10<br>"
-                f"Sector: {analysis.get('sector')}<br>"
-                f"Sentiment: {analysis.get('sentiment')}<br>"
-                f"NASDAQ: {analysis.get('is_nasdaq')}<br>"
-                f"Market cap: {analysis.get('market_cap_usd')}<br>"
-                f"Move potential: {analysis.get('move_potential')}<br>"
-                f"Earnings surprise: {analysis.get('earnings_surprise')}<br>"
-                f"Action: {analysis.get('action')}<br>"
-                f"Reason: {analysis.get('reason')}<br>"
-                f"<a href='{link}'>{link}</a ><br><br>"
-            )
-
-        return (
-            f"<h3>StockTitan NASDAQ >= $1B AI / Semiconductor / Optical / CPO / Earnings Surprise Filter</h3>"
-            f"<p>Daily AI used: {daily_ai_count}/{MAX_AI_ANALYSIS_PER_DAY}</p >"
-            + "".join(items)
-        )
-
-    except Exception as e:
-        return f"Error: {e}"
-
-threading.Thread(target=news_worker, daemon=True).start()
-
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=10000)
+        and action == "
