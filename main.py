@@ -1,6 +1,6 @@
 from flask import Flask
 import requests
-import feedparser
+from bs4 import BeautifulSoup
 import os
 import threading
 import time
@@ -13,12 +13,11 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
-RSS_URL = "https://www.stocktitan.net/news/today/rss.xml"
+NEWS_URL = "https://www.stocktitan.net/news/live.html"
 
 client = OpenAI(api_key=OPENAI_API_KEY)
 
 seen_links = set()
-
 MIN_SCORE = 7
 
 def send_telegram(text):
@@ -36,6 +35,51 @@ def send_telegram(text):
         }, timeout=10)
     except Exception as e:
         print("Telegram send error:", e)
+
+def fetch_latest_news():
+    headers = {
+        "User-Agent": "Mozilla/5.0"
+    }
+
+    r = requests.get(NEWS_URL, headers=headers, timeout=15)
+    r.raise_for_status()
+
+    soup = BeautifulSoup(r.text, "html.parser")
+    results = []
+
+    for a in soup.find_all("a", href=True):
+        href = a.get("href", "")
+        title = " ".join(a.get_text(" ", strip=True).split())
+
+        if not title:
+            continue
+
+        if "/news/" not in href:
+            continue
+
+        if href.startswith("/"):
+            link = "https://www.stocktitan.net" + href
+        else:
+            link = href
+
+        if "stocktitan.net/news/" not in link:
+            continue
+
+        if len(title) < 20:
+            continue
+
+        item = {
+            "title": title,
+            "link": link
+        }
+
+        if item not in results:
+            results.append(item)
+
+        if len(results) >= 10:
+            break
+
+    return results
 
 def analyze_news(title, link):
     if not OPENAI_API_KEY:
@@ -67,6 +111,10 @@ def analyze_news(title, link):
 - 回购
 - 短线可能引发逼空
 - 小市值公司出现重大利好
+- 大额融资
+- 债务重组成功
+- 重大合同
+- 监管批准
 
 重点降低评分的新闻：
 - 会议演讲
@@ -93,7 +141,7 @@ def analyze_news(title, link):
 
     try:
         response = client.chat.completions.create(
-            model="gpt-5.4-mini",
+            model="gpt-4.1-mini",
             messages=[
                 {"role": "user", "content": prompt}
             ],
@@ -124,13 +172,13 @@ def analyze_news(title, link):
 def news_worker():
     while True:
         try:
-            feed = feedparser.parse(RSS_URL)
+            news_items = fetch_latest_news()
 
-            for entry in feed.entries[:10]:
-                title = entry.get("title", "")
-                link = entry.get("link", "")
+            for item in news_items:
+                title = item["title"]
+                link = item["link"]
 
-                if not link or link in seen_links:
+                if link in seen_links:
                     continue
 
                 seen_links.add(link)
@@ -158,35 +206,39 @@ def news_worker():
 
 @app.route("/")
 def home():
-    return "stock-news-bot with AI filter is running"
+    return "stock-news-bot with AI webpage filter is running"
 
 @app.route("/test")
 def test():
-    send_telegram("✅ stock-news-bot AI version test message")
+    send_telegram("✅ stock-news-bot AI webpage version test message")
     return "test sent"
 
 @app.route("/latest")
 def latest():
-    feed = feedparser.parse(RSS_URL)
+    try:
+        news_items = fetch_latest_news()
 
-    if not feed.entries:
-        return "No news found from RSS."
+        if not news_items:
+            return "No news found from StockTitan webpage."
 
-    items = []
-    for entry in feed.entries[:5]:
-        title = entry.get("title", "")
-        link = entry.get("link", "")
-        analysis = analyze_news(title, link)
+        items = []
+        for item in news_items[:5]:
+            title = item["title"]
+            link = item["link"]
+            analysis = analyze_news(title, link)
 
-        items.append(
-            f"<b>{title}</b><br>"
-            f"Score: {analysis.get('score')}/10<br>"
-            f"Sentiment: {analysis.get('sentiment')}<br>"
-            f"Reason: {analysis.get('reason')}<br>"
-            f"<a href=' '>{link}</a ><br><br>"
-        )
+            items.append(
+                f"<b>{title}</b><br>"
+                f"Score: {analysis.get('score')}/10<br>"
+                f"Sentiment: {analysis.get('sentiment')}<br>"
+                f"Reason: {analysis.get('reason')}<br>"
+                f"<a href=' '>{link}</a ><br><br>"
+            )
 
-    return "<h3>Latest StockTitan News AI Analysis</h3>" + "".join(items)
+        return "<h3>Latest StockTitan News AI Analysis</h3>" + "".join(items)
+
+    except Exception as e:
+        return f"Error: {e}"
 
 threading.Thread(target=news_worker, daemon=True).start()
 
