@@ -15,8 +15,6 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
-NEWS_URL = "https://www.stocktitan.net/rss"
-
 client = OpenAI(api_key=OPENAI_API_KEY)
 
 seen_links = set()
@@ -26,6 +24,29 @@ MAX_AI_ANALYSIS_PER_DAY = 100
 
 daily_ai_count = 0
 daily_count_date = date.today()
+
+FEED_URLS = [
+    {
+        "name": "StockTitan",
+        "url": "https://www.stocktitan.net/rss"
+    },
+    {
+        "name": "GlobeNewswire Public Companies",
+        "url": "https://www.globenewswire.com/RssFeed/orgclass/1/feedTitle/GlobeNewswire%20-%20News%20about%20Public%20Companies"
+    },
+    {
+        "name": "GlobeNewswire Earnings",
+        "url": "https://www.globenewswire.com/RssFeed/subjectcode/13-Earnings%20Releases%20And%20Operating%20Results/feedTitle/GlobeNewswire%20-%20Earnings%20Releases%20And%20Operating%20Results"
+    },
+    {
+        "name": "GlobeNewswire M&A",
+        "url": "https://www.globenewswire.com/RssFeed/subjectcode/27-Mergers%20and%20Acquisitions/feedTitle/GlobeNewswire%20-%20Mergers%20and%20Acquisitions"
+    },
+    {
+        "name": "GlobeNewswire Stock Market News",
+        "url": "https://www.globenewswire.com/RssFeed/subjectcode/39-Stock%20Market%20News/feedTitle/GlobeNewswire%20-%20Stock%20Market%20News"
+    }
+]
 
 KEYWORDS = [
     "AI", "artificial intelligence", "machine learning",
@@ -138,6 +159,7 @@ def reset_daily_counter_if_needed():
     global daily_ai_count, daily_count_date
 
     today = date.today()
+
     if today != daily_count_date:
         daily_count_date = today
         daily_ai_count = 0
@@ -174,29 +196,57 @@ def low_value_match(text):
 
 
 def fetch_latest_news():
-    feed = feedparser.parse(NEWS_URL)
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124 Safari/537.36",
+        "Accept": "application/rss+xml, application/xml, text/xml, */*",
+    }
 
     results = []
+    seen_in_fetch = set()
 
-    for entry in feed.entries[:30]:
-        title = entry.get("title", "")
-        link = entry.get("link", "")
+    for feed_info in FEED_URLS:
+        source_name = feed_info["name"]
+        feed_url = feed_info["url"]
 
-        title = " ".join(title.split())
-        link = link.strip()
+        try:
+            response = requests.get(feed_url, headers=headers, timeout=15)
+            response.raise_for_status()
 
-        if not title or not link:
-            continue
+            feed = feedparser.parse(response.text)
 
-        item = {"title": title, "link": link}
+            for entry in feed.entries[:20]:
+                title = entry.get("title", "")
+                link = entry.get("link", "")
+                summary = entry.get("summary", "")
 
-        if item not in results:
-            results.append(item)
+                title = " ".join(title.split())
+                link = link.strip()
+                summary = " ".join(summary.split())
 
-    return results
+                if not title or not link:
+                    continue
+
+                if link in seen_in_fetch:
+                    continue
+
+                seen_in_fetch.add(link)
+
+                item = {
+                    "source": source_name,
+                    "title": title,
+                    "link": link,
+                    "summary": summary
+                }
+
+                results.append(item)
+
+        except Exception as e:
+            print(f"Feed fetch error from {source_name}: {e}")
+
+    return results[:50]
 
 
-def fetch_article_text(link):
+def fetch_article_text(link, summary=""):
     headers = {"User-Agent": "Mozilla/5.0"}
 
     try:
@@ -205,11 +255,13 @@ def fetch_article_text(link):
 
         soup = BeautifulSoup(response.text, "html.parser")
         text = " ".join(soup.get_text(" ", strip=True).split())
-        return text[:7000]
+
+        combined = f"{summary} {text}"
+        return combined[:7000]
 
     except Exception as e:
         print("Article fetch error:", e)
-        return ""
+        return summary[:3000]
 
 
 def is_nasdaq_article(title, article_text):
@@ -415,19 +467,19 @@ def should_push(analysis):
     )
 
 
-def process_news_item(title, link):
-    article_text = fetch_article_text(link)
+def process_news_item(source, title, link, summary=""):
+    article_text = fetch_article_text(link, summary)
 
     passed, filter_reason = pre_filter_news(title, article_text)
 
     if not passed:
-        print(f"Skipped prefilter: {title} | {filter_reason}")
+        print(f"Skipped prefilter: [{source}] {title} | {filter_reason}")
         return None
 
     analysis = analyze_news(title, link, article_text)
 
     print(
-        f"Checked: {title} | "
+        f"Checked: [{source}] {title} | "
         f"Score: {analysis.get('score')} | "
         f"NASDAQ: {analysis.get('is_nasdaq')} | "
         f"MarketCap: {analysis.get('market_cap_usd')} | "
@@ -438,6 +490,7 @@ def process_news_item(title, link):
     if should_push(analysis):
         message = (
             f"🚨 NASDAQ 热门板块高价值新闻\n\n"
+            f"来源：{source}\n"
             f"评分：{analysis.get('score')}/10\n"
             f"方向：{analysis.get('sector')}\n"
             f"情绪：{analysis.get('sentiment')}\n"
@@ -459,14 +512,16 @@ def news_worker():
             news_items = fetch_latest_news()
 
             for item in news_items:
+                source = item["source"]
                 title = item["title"]
                 link = item["link"]
+                summary = item.get("summary", "")
 
                 if link in seen_links:
                     continue
 
                 seen_links.add(link)
-                process_news_item(title, link)
+                process_news_item(source, title, link, summary)
 
         except Exception as e:
             print("News worker error:", e)
@@ -476,12 +531,12 @@ def news_worker():
 
 @app.route("/")
 def home():
-    return "stock-news-bot RSS NASDAQ >=1B hot sectors AI filter is running"
+    return "stock-news-bot multi-source NASDAQ >=1B hot sectors AI filter is running"
 
 
 @app.route("/test")
 def test():
-    send_telegram("✅ stock-news-bot RSS NASDAQ >=1B hot sectors AI filter test message")
+    send_telegram("✅ stock-news-bot multi-source NASDAQ >=1B hot sectors AI filter test message")
     return "test sent"
 
 
@@ -493,20 +548,23 @@ def latest():
         news_items = fetch_latest_news()
 
         if not news_items:
-            return "No news found from StockTitan RSS."
+            return "No news found from RSS feeds."
 
         items = []
 
-        for item in news_items[:10]:
+        for item in news_items[:12]:
+            source = item["source"]
             title = item["title"]
             link = item["link"]
-            article_text = fetch_article_text(link)
+            summary = item.get("summary", "")
+
+            article_text = fetch_article_text(link, summary)
 
             passed, filter_reason = pre_filter_news(title, article_text)
 
             if not passed:
                 items.append(
-                    f"<b>{title}</b><br>"
+                    f"<b>[{source}] {title}</b><br>"
                     f"Pre-filter: SKIP<br>"
                     f"Reason: {filter_reason}<br>"
                     f"<a href='{link}'>{link}</a><br><br>"
@@ -516,7 +574,7 @@ def latest():
             analysis = analyze_news(title, link, article_text)
 
             items.append(
-                f"<b>{title}</b><br>"
+                f"<b>[{source}] {title}</b><br>"
                 f"Score: {analysis.get('score')}/10<br>"
                 f"Sector: {analysis.get('sector')}<br>"
                 f"Sentiment: {analysis.get('sentiment')}<br>"
@@ -530,7 +588,7 @@ def latest():
             )
 
         return (
-            f"<h3>StockTitan RSS NASDAQ >= $1B Hot Sectors AI Filter</h3>"
+            f"<h3>Multi-source RSS NASDAQ >= $1B Hot Sectors AI Filter</h3>"
             f"<p>Daily AI used: {daily_ai_count}/{MAX_AI_ANALYSIS_PER_DAY}</p>"
             + "".join(items)
         )
