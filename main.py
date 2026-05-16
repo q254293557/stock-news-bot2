@@ -13,7 +13,7 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
-RSS_URL = "https://www.stocktitan.net/news/rss.xml"
+RSS_URL = "https://www.stocktitan.net/news/today/rss.xml"
 
 client = OpenAI(api_key=OPENAI_API_KEY)
 
