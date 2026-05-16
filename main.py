@@ -440,4 +440,8 @@ def process_news_item(title, link):
 
     if (
         score >= MIN_SCORE
-        and action == "
+        and action == "push"
+        and is_nasdaq is True
+        and market_cap_usd == ">=1B"
+        and move_potential in ["high", "medium"]
+    ):
