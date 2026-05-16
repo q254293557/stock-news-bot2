@@ -5,6 +5,7 @@ import os
 import threading
 import time
 import json
+from datetime import date
 from openai import OpenAI
 
 app = Flask(__name__)
@@ -18,7 +19,48 @@ NEWS_URL = "https://www.stocktitan.net/news/live.html"
 client = OpenAI(api_key=OPENAI_API_KEY)
 
 seen_links = set()
+
 MIN_SCORE = 7
+MAX_AI_ANALYSIS_PER_DAY = 100
+daily_ai_count = 0
+daily_count_date = date.today()
+
+KEYWORDS = [
+    # AI / 半导体 / 光模块 / CPO / 数据中心
+    "AI", "artificial intelligence", "machine learning",
+    "semiconductor", "chip", "chips", "GPU", "NVIDIA", "NVDA",
+    "data center", "datacenter", "hyperscale", "hyperscaler",
+    "optical", "photonics", "silicon photonics",
+    "CPO", "co-packaged optics",
+    "transceiver", "optical module", "fiber optic",
+    "800G", "1.6T", "400G",
+    "laser", "VCSEL",
+    "pluggable", "ethernet",
+    "inference", "accelerator",
+    "AI infrastructure", "networking", "switching",
+    "compute", "cloud", "server",
+
+    # 财报超预期 / guidance
+    "earnings", "results", "financial results",
+    "quarterly results", "q1 results", "q2 results", "q3 results", "q4 results",
+    "revenue", "revenues", "sales",
+    "EPS", "earnings per share",
+    "beat", "beats", "exceeds", "exceeded", "above expectations",
+    "raises guidance", "raise guidance", "raised guidance",
+    "guidance", "outlook", "forecast",
+    "record revenue", "record revenues",
+    "profit", "margin", "gross margin"
+]
+
+LOW_VALUE_WORDS = [
+    "conference", "webcast", "presentation",
+    "appoints", "appointment", "management change",
+    "to participate", "investor conference",
+    "announces date", "earnings call",
+    "shareholder meeting",
+    "fireside chat", "annual meeting",
+    "to present at", "will attend"
+]
 
 def send_telegram(text):
     if not BOT_TOKEN or not CHAT_ID:
@@ -35,6 +77,34 @@ def send_telegram(text):
         }, timeout=10)
     except Exception as e:
         print("Telegram send error:", e)
+
+def reset_daily_counter_if_needed():
+    global daily_ai_count, daily_count_date
+
+    today = date.today()
+    if today != daily_count_date:
+        daily_count_date = today
+        daily_ai_count = 0
+
+def keyword_match(text):
+    t = text.lower()
+    return any(k.lower() in t for k in KEYWORDS)
+
+def low_value_match(text):
+    t = text.lower()
+
+    # 如果是财报新闻，不因为 earnings call / announces date 误杀
+    earnings_terms = [
+        "reports", "reported", "financial results",
+        "quarterly results", "revenue", "eps",
+        "raises guidance", "raised guidance",
+        "beats", "exceeds", "record revenue"
+    ]
+
+    if any(e.lower() in t for e in earnings_terms):
+        return False
+
+    return any(w.lower() in t for w in LOW_VALUE_WORDS)
 
 def fetch_latest_news():
     headers = {
@@ -76,53 +146,144 @@ def fetch_latest_news():
         if item not in results:
             results.append(item)
 
-        if len(results) >= 10:
+        if len(results) >= 25:
             break
 
     return results
 
-def analyze_news(title, link):
+def fetch_article_text(link):
+    headers = {
+        "User-Agent": "Mozilla/5.0"
+    }
+
+    try:
+        r = requests.get(link, headers=headers, timeout=15)
+        r.raise_for_status()
+
+        soup = BeautifulSoup(r.text, "html.parser")
+        text = " ".join(soup.get_text(" ", strip=True).split())
+        return text[:6000]
+
+    except Exception as e:
+        print("Article fetch error:", e)
+        return ""
+
+def is_nasdaq_article(title, article_text):
+    text = f"{title} {article_text}".lower()
+
+    if "nasdaq:" in text:
+        return True
+
+    if "nasdaq capital market" in text:
+        return True
+
+    if "nasdaqcm" in text or "nasdaqgs" in text or "nasdaqgm" in text:
+        return True
+
+    return False
+
+def pre_filter_news(title, article_text):
+    combined = f"{title} {article_text}"
+
+    if low_value_match(combined):
+        return False, "低价值新闻，跳过，不消耗 AI 额度"
+
+    if not keyword_match(combined):
+        return False, "不属于 AI / 半导体 / 光模块 / CPO / 数据中心 / 财报超预期方向，跳过"
+
+    if not is_nasdaq_article(title, article_text):
+        return False, "不是 NASDAQ 股票新闻，跳过"
+
+    return True, "通过预筛选"
+
+def analyze_news(title, link, article_text):
+    global daily_ai_count
+
+    reset_daily_counter_if_needed()
+
+    if daily_ai_count >= MAX_AI_ANALYSIS_PER_DAY:
+        return {
+            "score": 0,
+            "sentiment": "unknown",
+            "sector": "unknown",
+            "is_nasdaq": False,
+            "market_cap_usd": "unknown",
+            "move_potential": "unknown",
+            "earnings_surprise": "unknown",
+            "reason": f"今日 AI 分析已达上限 {MAX_AI_ANALYSIS_PER_DAY} 条，跳过",
+            "action": "skip"
+        }
+
     if not OPENAI_API_KEY:
         return {
             "score": 0,
             "sentiment": "unknown",
+            "sector": "unknown",
+            "is_nasdaq": False,
+            "market_cap_usd": "unknown",
+            "move_potential": "unknown",
+            "earnings_surprise": "unknown",
             "reason": "OPENAI_API_KEY missing",
             "action": "skip"
         }
 
-    prompt = f"""
-你是美股事件驱动交易员，专门分析短线新闻是否可能引发股价大幅波动。
+    daily_ai_count += 1
 
-请分析下面这条 StockTitan 新闻，只输出 JSON，不要输出其它文字。
+    prompt = f"""
+你是美股事件驱动交易员，专门筛选短线可能大涨的 NASDAQ 股票新闻。
+
+目标：
+只推送两类高价值新闻：
+
+A类：AI、半导体、光模块、CPO、数据中心、硅光、光通信、GPU、800G、1.6T、VCSEL 等相关高价值新闻。
+
+B类：纳斯达克上市公司财报明显超预期的新闻，包括 revenue beat、EPS beat、raises guidance、record revenue、margin improvement、strong outlook、backlog growth 等。
+
+硬性推送条件：
+1. 必须是 NASDAQ 上市公司；
+2. 估算市值必须在 10 亿美元及以上，也就是 market_cap_usd 必须返回 ">=1B"；
+3. 新闻必须满足以下至少一种：
+   - 属于 AI / 半导体 / 光模块 / CPO / 数据中心 / 硅光 / 光通信 / GPU / 高速互联方向；
+   - 或者属于财报明显超预期 / guidance 上调 / revenue 或 EPS 大幅 beat；
+4. 评分必须 >= 7；
+5. 短线暴涨潜力必须是 high 或 medium；
+6. 满足以上条件才 action = "push"，否则 action = "skip"。
 
 评分标准：
-0-3 = 垃圾新闻/无交易价值
-4-6 = 普通新闻/可看可不看
+0-3 = 垃圾新闻 / 无交易价值
+4-6 = 普通新闻 / 不推送
 7-8 = 值得推送，可能引起明显波动
-9-10 = 极强新闻，可能暴涨/暴跌/逼空
+9-10 = 极强新闻，可能暴涨 / 逼空 / 连续拉升
 
-重点提高评分的新闻：
-- 上调 guidance
-- 财报大超预期
-- 大订单
-- NVIDIA / Microsoft / Amazon / hyperscaler 合作
-- FDA approval / phase 3 成功
-- buyout / acquisition / strategic alternatives
-- 回购
-- 短线可能引发逼空
-- 小市值公司出现重大利好
-- 大额融资
-- 债务重组成功
-- 重大合同
-- 监管批准
+重点提高评分：
+- 财报大幅超预期
+- EPS beat + revenue beat
+- 上调全年 guidance
+- record revenue
+- 毛利率明显改善
+- backlog 明显增长
+- AI 数据中心订单
+- 大额订单
+- 大客户合作
+- NVIDIA / Microsoft / Amazon / Google / Meta / hyperscaler 合作
+- 半导体产品进入量产
+- 光模块 / CPO / 硅光 / 800G / 1.6T 相关重大进展
+- 大金额融资
+- buyout / acquisition / tender offer / strategic alternatives
+- 10 亿美元以上但仍容易异动的中小市值 NASDAQ 公司
 
-重点降低评分的新闻：
+重点降低评分：
+- 只是公布财报日期
+- 只是 earnings call 通知
 - 会议演讲
 - 普通任命
-- 无金额合作
+- 没金额的合作
 - 常规展示
 - 普通 PR
-- 无实质内容新闻
+- 市值低于 10 亿美元
+- 大盘成熟公司但催化不强
+- 业绩 beat 但 guidance 下调
+- 收入增长弱、亏损扩大、现金流恶化
 
 新闻标题：
 {title}
@@ -130,11 +291,19 @@ def analyze_news(title, link):
 新闻链接：
 {link}
 
-请严格返回这个 JSON 格式：
+新闻正文节选：
+{article_text[:3500]}
+
+请严格返回 JSON，不要输出任何多余文字：
 {{
   "score": 0,
   "sentiment": "bullish/bearish/neutral",
-  "reason": "一句话说明为什么",
+  "sector": "AI/semiconductor/optical/CPO/datacenter/earnings/other",
+  "is_nasdaq": true,
+  "market_cap_usd": ">=1B/<1B/unknown",
+  "move_potential": "high/medium/low/unknown",
+  "earnings_surprise": "strong/medium/weak/none/unknown",
+  "reason": "一句话说明为什么值得或不值得推送",
   "action": "push/skip"
 }}
 """
@@ -156,6 +325,11 @@ def analyze_news(title, link):
         return {
             "score": int(data.get("score", 0)),
             "sentiment": data.get("sentiment", "neutral"),
+            "sector": data.get("sector", "other"),
+            "is_nasdaq": data.get("is_nasdaq", False),
+            "market_cap_usd": data.get("market_cap_usd", "unknown"),
+            "move_potential": data.get("move_potential", "unknown"),
+            "earnings_surprise": data.get("earnings_surprise", "unknown"),
             "reason": data.get("reason", ""),
             "action": data.get("action", "skip")
         }
@@ -165,9 +339,63 @@ def analyze_news(title, link):
         return {
             "score": 0,
             "sentiment": "unknown",
+            "sector": "unknown",
+            "is_nasdaq": False,
+            "market_cap_usd": "unknown",
+            "move_potential": "unknown",
+            "earnings_surprise": "unknown",
             "reason": f"AI分析失败: {e}",
             "action": "skip"
         }
+
+def process_news_item(title, link):
+    article_text = fetch_article_text(link)
+
+    passed, filter_reason = pre_filter_news(title, article_text)
+
+    if not passed:
+        print(f"Skipped prefilter: {title} | {filter_reason}")
+        return None
+
+    analysis = analyze_news(title, link, article_text)
+
+    score = analysis.get("score", 0)
+    action = analysis.get("action", "skip")
+    is_nasdaq = analysis.get("is_nasdaq", False)
+    market_cap_usd = analysis.get("market_cap_usd", "unknown")
+    move_potential = analysis.get("move_potential", "unknown")
+
+    print(
+        f"Checked: {title} | "
+        f"Score: {score} | "
+        f"NASDAQ: {is_nasdaq} | "
+        f"MarketCap: {market_cap_usd} | "
+        f"Move: {move_potential} | "
+        f"Action: {action}"
+    )
+
+    if (
+        score >= MIN_SCORE
+        and action == "push"
+        and is_nasdaq is True
+        and market_cap_usd == ">=1B"
+        and move_potential in ["high", "medium"]
+    ):
+        message = (
+            f"🚨 NASDAQ 高价值新闻\n\n"
+            f"评分：{score}/10\n"
+            f"方向：{analysis.get('sector')}\n"
+            f"情绪：{analysis.get('sentiment')}\n"
+            f"市值判断：{market_cap_usd}\n"
+            f"暴涨潜力：{move_potential}\n"
+            f"财报超预期：{analysis.get('earnings_surprise')}\n"
+            f"原因：{analysis.get('reason')}\n\n"
+            f"标题：{title}\n\n"
+            f"{link}"
+        )
+        send_telegram(message)
+
+    return analysis
 
 def news_worker():
     while True:
@@ -183,21 +411,7 @@ def news_worker():
 
                 seen_links.add(link)
 
-                analysis = analyze_news(title, link)
-                score = analysis.get("score", 0)
-
-                print(f"Checked: {title} | Score: {score}")
-
-                if score >= MIN_SCORE and analysis.get("action") == "push":
-                    message = (
-                        f"🚨 高价值 StockTitan 新闻\n\n"
-                        f"评分：{score}/10\n"
-                        f"方向：{analysis.get('sentiment')}\n"
-                        f"原因：{analysis.get('reason')}\n\n"
-                        f"标题：{title}\n\n"
-                        f"{link}"
-                    )
-                    send_telegram(message)
+                process_news_item(title, link)
 
         except Exception as e:
             print("News worker error:", e)
@@ -206,36 +420,62 @@ def news_worker():
 
 @app.route("/")
 def home():
-    return "stock-news-bot with AI webpage filter is running"
+    return "stock-news-bot NASDAQ >=1B AI semiconductor optical CPO earnings surprise filter is running"
 
 @app.route("/test")
 def test():
-    send_telegram("✅ stock-news-bot AI webpage version test message")
+    send_telegram("✅ stock-news-bot NASDAQ >=1B AI + earnings filter test message")
     return "test sent"
 
 @app.route("/latest")
 def latest():
     try:
+        reset_daily_counter_if_needed()
+
         news_items = fetch_latest_news()
 
         if not news_items:
             return "No news found from StockTitan webpage."
 
         items = []
-        for item in news_items[:5]:
+
+        for item in news_items[:8]:
             title = item["title"]
             link = item["link"]
-            analysis = analyze_news(title, link)
+            article_text = fetch_article_text(link)
+
+            passed, filter_reason = pre_filter_news(title, article_text)
+
+            if not passed:
+                items.append(
+                    f"<b>{title}</b><br>"
+                    f"Pre-filter: SKIP<br>"
+                    f"Reason: {filter_reason}<br>"
+                    f"<a href=' '>{link}</a ><br><br>"
+                )
+                continue
+
+            analysis = analyze_news(title, link, article_text)
 
             items.append(
                 f"<b>{title}</b><br>"
                 f"Score: {analysis.get('score')}/10<br>"
+                f"Sector: {analysis.get('sector')}<br>"
                 f"Sentiment: {analysis.get('sentiment')}<br>"
+                f"NASDAQ: {analysis.get('is_nasdaq')}<br>"
+                f"Market cap: {analysis.get('market_cap_usd')}<br>"
+                f"Move potential: {analysis.get('move_potential')}<br>"
+                f"Earnings surprise: {analysis.get('earnings_surprise')}<br>"
+                f"Action: {analysis.get('action')}<br>"
                 f"Reason: {analysis.get('reason')}<br>"
-                f"<a href=' '>{link}</a ><br><br>"
+                f"<a href='{link}'>{link}</a ><br><br>"
             )
 
-        return "<h3>Latest StockTitan News AI Analysis</h3>" + "".join(items)
+        return (
+            f"<h3>StockTitan NASDAQ >= $1B AI / Semiconductor / Optical / CPO / Earnings Surprise Filter</h3>"
+            f"<p>Daily AI used: {daily_ai_count}/{MAX_AI_ANALYSIS_PER_DAY}</p >"
+            + "".join(items)
+        )
 
     except Exception as e:
         return f"Error: {e}"
