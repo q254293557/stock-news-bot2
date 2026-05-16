@@ -1,6 +1,7 @@
 from flask import Flask
 import requests
 from bs4 import BeautifulSoup
+import feedparser
 import os
 import threading
 import time
@@ -14,7 +15,7 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
-NEWS_URL = "https://www.stocktitan.net/news/live.html"
+NEWS_URL = "https://www.stocktitan.net/rss"
 
 client = OpenAI(api_key=OPENAI_API_KEY)
 
@@ -173,42 +174,24 @@ def low_value_match(text):
 
 
 def fetch_latest_news():
-    headers = {"User-Agent": "Mozilla/5.0"}
+    feed = feedparser.parse(NEWS_URL)
 
-    response = requests.get(NEWS_URL, headers=headers, timeout=15)
-    response.raise_for_status()
-
-    soup = BeautifulSoup(response.text, "html.parser")
     results = []
 
-    for a_tag in soup.find_all("a", href=True):
-        href = a_tag.get("href", "")
-        title = " ".join(a_tag.get_text(" ", strip=True).split())
+    for entry in feed.entries[:30]:
+        title = entry.get("title", "")
+        link = entry.get("link", "")
 
-        if not title:
-            continue
+        title = " ".join(title.split())
+        link = link.strip()
 
-        if "/news/" not in href:
-            continue
-
-        if href.startswith("/"):
-            link = "https://www.stocktitan.net" + href
-        else:
-            link = href
-
-        if "stocktitan.net/news/" not in link:
-            continue
-
-        if len(title) < 20:
+        if not title or not link:
             continue
 
         item = {"title": title, "link": link}
 
         if item not in results:
             results.append(item)
-
-        if len(results) >= 30:
-            break
 
     return results
 
@@ -493,12 +476,12 @@ def news_worker():
 
 @app.route("/")
 def home():
-    return "stock-news-bot NASDAQ >=1B hot sectors AI filter is running"
+    return "stock-news-bot RSS NASDAQ >=1B hot sectors AI filter is running"
 
 
 @app.route("/test")
 def test():
-    send_telegram("✅ stock-news-bot NASDAQ >=1B hot sectors AI filter test message")
+    send_telegram("✅ stock-news-bot RSS NASDAQ >=1B hot sectors AI filter test message")
     return "test sent"
 
 
@@ -510,7 +493,7 @@ def latest():
         news_items = fetch_latest_news()
 
         if not news_items:
-            return "No news found from StockTitan webpage."
+            return "No news found from StockTitan RSS."
 
         items = []
 
@@ -547,7 +530,7 @@ def latest():
             )
 
         return (
-            f"<h3>StockTitan NASDAQ >= $1B Hot Sectors AI Filter</h3>"
+            f"<h3>StockTitan RSS NASDAQ >= $1B Hot Sectors AI Filter</h3>"
             f"<p>Daily AI used: {daily_ai_count}/{MAX_AI_ANALYSIS_PER_DAY}</p>"
             + "".join(items)
         )
